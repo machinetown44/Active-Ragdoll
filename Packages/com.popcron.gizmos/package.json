@@ -1,0 +1,8 @@
+{
+  "name": "com.popcron.gizmos",
+  "displayName": "Popcron Gizmos",
+  "version": "1.6.8",
+  "unity": "2018.3",
+  "description": "Quick GL drawing utility for debugging.",
+  "_fingerprint": "676901ae8b74471762f89f0e85172a2402c6a0fd"
+}

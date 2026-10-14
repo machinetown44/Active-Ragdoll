@@ -1,0 +1,68 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9582a0cfbb4722247be3009d814727b4, type: 3}
+  m_Name: Bind_Robot Kyle
+  m_EditorClassIdentifier: Box3DArticulation::Box3DArticulation.HumanoidMotionBindAsset
+  points:
+  - nodeName: Pelvis
+    tip: {x: 0.012049437, y: 0.75999975, z: 0.013539314}
+    pivot: {x: 0.012049437, y: 0.9399996, z: 0.013539314}
+    roll: {x: 0.013048887, y: 0.90473986, z: -0.9664068}
+  - nodeName: Waist
+    tip: {x: 0.012049437, y: 1.0899997, z: 0.013539314}
+    pivot: {x: 0.012049437, y: 0.9399996, z: 0.013539314}
+    roll: {x: 0.013048887, y: -0.099000454, z: -0.002459526}
+  - nodeName: Torso
+    tip: {x: 0.012049437, y: 1.4399996, z: 0.013539314}
+    pivot: {x: 0.012049437, y: 1.0899997, z: 0.013539314}
+    roll: {x: 0.013048887, y: 0.9570651, z: -0.97140217}
+  - nodeName: Neck
+    tip: {x: 0.012049437, y: 1.5199995, z: 0.013539314}
+    pivot: {x: 0.012049437, y: 1.4399996, z: 0.013539314}
+    roll: {x: 0.013048887, y: -0.099000454, z: -0.002459526}
+  - nodeName: Head
+    tip: {x: 0.012049437, y: 1.7199993, z: 0.013539314}
+    pivot: {x: 0.012049437, y: 1.5199995, z: 0.013539314}
+    roll: {x: 0.013048887, y: 1.730514, z: -0.9688635}
+  - nodeName: LeftThigh
+    tip: {x: -0.107949495, y: 0.3399992, z: 0.013539314}
+    pivot: {x: -0.107949495, y: 0.7599993, z: 0.013539314}
+    roll: {x: 0.16414523, y: 0.8129873, z: 0.048132896}
+  - nodeName: LeftCalf
+    tip: {x: -0.107949495, y: -0.08000088, z: 0.013539314}
+    pivot: {x: -0.107949495, y: 0.3399992, z: 0.013539314}
+    roll: {x: 0.013048887, y: -0.099000454, z: 0.9975405}
+  - nodeName: RightThigh
+    tip: {x: 0.13205028, y: 0.3399992, z: 0.013539314}
+    pivot: {x: 0.13205028, y: 0.7599993, z: 0.013539314}
+    roll: {x: 0.44195628, y: 0.8129878, z: 0.048132896}
+  - nodeName: RightCalf
+    tip: {x: 0.13205028, y: -0.08000088, z: 0.013539314}
+    pivot: {x: 0.13205028, y: 0.3399992, z: 0.013539314}
+    roll: {x: 0.013048887, y: -0.099000454, z: 0.9975405}
+  - nodeName: LeftUpperArm
+    tip: {x: -0.4279492, y: 1.3849995, z: 0.013539314}
+    pivot: {x: -0.12794995, y: 1.3849995, z: 0.013539314}
+    roll: {x: -0.21154904, y: 1.1529822, z: -1.0214853}
+  - nodeName: LeftForearm
+    tip: {x: -0.7079499, y: 1.3849995, z: 0.013539314}
+    pivot: {x: -0.4279492, y: 1.3849995, z: 0.013539314}
+    roll: {x: 0.013048887, y: -0.099000454, z: -0.002459526}
+  - nodeName: RightUpperArm
+    tip: {x: 0.45204997, y: 1.3849995, z: 0.013539314}
+    pivot: {x: 0.15204883, y: 1.3849995, z: 0.013539314}
+    roll: {x: 0.4157951, y: 1.1469302, z: 1.2970667}
+  - nodeName: RightForearm
+    tip: {x: 0.73205066, y: 1.3849998, z: 0.013539314}
+    pivot: {x: 0.45204997, y: 1.3849995, z: 0.013539314}
+    roll: {x: 0.43277812, y: 0.33346176, z: 0.09911823}
+  frameVersion: 1

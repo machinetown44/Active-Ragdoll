@@ -1,0 +1,1210 @@
+using System;
+using System.Collections.Generic;
+using Box3D;
+using Box3D.Hybrid;
+using Unity.Mathematics;
+using UnityEngine;
+using Joint = Box3D.Joint;
+namespace Box3DArticulation
+{
+    [Serializable]
+    public struct RailLimb
+    {
+        public Box3DBody upperBody;
+        public Box3DBody lowerBody;
+        [Min(0.01f)] public float upperLength;
+        [Min(0.01f)] public float lowerLength;
+        [Min(0f)] public float shoulderOffsetFromMidpoint;
+        [Tooltip("Persistent order on the authored spline. Use TowardStart for the start-side chain and TowardEnd for the end-side chain.")]
+        public SplineChainController.RailOrder railOrder;
+        [Min(0f)] public float slideSearchDistance;
+        [Min(0f)] public float maxSlideSpeed;
+        [Min(0f)] public float shoulderHertz;
+        [Range(0f, 2f)] public float shoulderDamping;
+        [Min(0f)] public float elbowHertz;
+        [Range(0f, 2f)] public float elbowDamping;
+        [Range(1f, 179f)] public float elbowLimitDegrees;
+        [Tooltip("Bend plane normal in upper body LOCAL space (also hinge axis). Left: (0,0,1), Right: (0,0,-1).")]
+        public Vector3 bendPlaneNormalLocal;
+    }
+
+    /// <summary>
+    /// A single open spline rail controls a torso and any number of multi-bone branches.
+    /// </summary>
+    [Serializable]
+    public struct SplineRail
+    {
+        [SerializeField] public Transform[] controlPoints;
+        [SerializeField, Min(2)] public int samplesPerSegment;
+        
+        // Runtime cache (not serialized)
+        [NonSerialized] public List<RailSample> samples;
+        [NonSerialized] public float length;
+    }
+
+    /// <summary>
+    /// A single open spline rail controls a torso and any number of multi-bone branches. The torso
+    /// alone receives external PD force/torque. Limbs receive only native Box3D spherical/hinge
+    /// joint targets derived from rail-projected root and tip points (intermediate joints solved via 1D FABRIK).
+    /// </summary>
+    [DisallowMultipleComponent]
+    public sealed class SplineChainController : MonoBehaviour
+    {
+        [Header("Character")]
+        [SerializeField] private Box3DBody torso;
+        [SerializeField] private Vector3 leftShoulderLocalAnchor;
+        [SerializeField] private Vector3 rightShoulderLocalAnchor;
+        [SerializeField] private RailLimb[] limbs = Array.Empty<RailLimb>();
+
+        [Header("Spline Rails")]
+        [SerializeField] private SplineRail[] rails = Array.Empty<SplineRail>();
+        [SerializeField, Range(1, 6), Tooltip("Fixed number of rail-constrained forward/backward passes per limb.")]
+        private int railSolveIterations = 3;
+
+        [Header("Torso-only god controller")]
+        [SerializeField] private bool disableGravity = true;
+        [SerializeField] private bool disableJointLimits = false;
+        [SerializeField, Min(0f)] private float positionGain = 9000f;
+        [SerializeField, Min(0f)] private float velocityGain = 2400f;
+        [SerializeField, Min(0f)] private float maxForce = 24000f;
+        [SerializeField, Min(0f)] private float orientationGain = 13000f;
+        [SerializeField, Min(0f)] private float angularVelocityGain = 3200f;
+        [SerializeField, Min(0f)] private float maxTorque = 20000f;
+
+        [Header("Rail Projection")]
+        [SerializeField, Min(0f)] private float shoulderBiasWeight = 0.01f;
+        [SerializeField, Min(0f)] private float unwrapBiasWeight = 0.02f;
+
+        [Header("Rail ownership")]
+        [SerializeField, Min(0f), Tooltip("Unowned gap around the authored spline midpoint. Chains toward the start and end can never enter each other's rail domain.")]
+        private float chainPartitionGap = 0.05f;
+
+        [Header("Debug")]
+        [SerializeField] private bool drawRail = true;
+        [SerializeField] private bool drawTargets = true;
+
+        private struct RailSample { public float s; public float3 position; public float3 tangent; }
+        
+        /// <summary>
+        /// Generic bone chain joint data for physics-driven IK.
+        /// Supports arbitrary number of bones with spherical/hinge joints.
+        /// </summary>
+        private struct BoneJoint
+        {
+            public JointId jointId;                // Box3D joint id (spherical or revolute)
+            public B3Transform frameA, frameB;     // Joint local frames (body A, body B)
+            public bool isHinge;                   // true = revolute (hinge), false = spherical
+            public float3 hingeAxisLocal;          // Hinge axis in body A local space (if isHinge)
+            public float3 boneAxisLocal;           // Bone direction in body A local space (at creation)
+            public float hertz, damping;           // Spring parameters
+            public float lowerLimit, upperLimit;   // Hinge limits (radians)
+        }
+        
+        /// <summary>
+        /// Runtime state for a single limb chain.
+        /// </summary>
+        private struct LimbRuntime
+        {
+            public BoneJoint[] joints;             // All joints in chain (root to tip)
+            public float3[] localAnchors;          // Local anchor of each joint on its parent body
+            public float[] boneLengths;            // Length of each bone segment
+            public float[] jointS;                 // Rail coordinate s for each joint (including root)
+            public bool hasProjection;
+            
+            // Cached for target computation
+            public quaternion rootBodyRotation;    // Root body (torso) rotation at joint creation
+            public float3 rootBodyPosition;        // Root body position at joint creation
+            public float3 fixedSideDirLocal;       // Body-local side direction: torso center -> shoulder anchor
+
+            // Legacy compatibility properties (map to jointS array for 2-bone limbs)
+            public float shoulderS { get => jointS != null && jointS.Length > 0 ? jointS[0] : 0f; set { if (jointS != null && jointS.Length > 0) jointS[0] = value; } }
+            public float elbowS { get => jointS != null && jointS.Length > 1 ? jointS[1] : 0f; set { if (jointS != null && jointS.Length > 1) jointS[1] = value; } }
+            public float handS { get => jointS != null && jointS.Length > 2 ? jointS[2] : 0f; set { if (jointS != null && jointS.Length > 2) jointS[2] = value; } }
+        }
+        
+        /// <summary>
+        /// Persistent ordering of a chain relative to the authored spline direction.
+        /// This is a rail-topology constraint, not a world-space left/right test.
+        /// </summary>
+        public enum RailOrder
+        {
+            Auto = 0,          // Compatibility: infer from rootOffsetFromMidpoint, then chain index.
+            TowardStart = -1,  // root > child 1 > ... > tip in arc-length s.
+            TowardEnd = 1      // root < child 1 < ... < tip in arc-length s.
+        }
+
+        /// <summary>
+        /// Configuration for a limb chain (set up in inspector or procedurally).
+        /// </summary>
+        [Serializable]
+        public struct LimbChain
+        {
+            public Box3DBody[] bodies;                 // Bodies from root to tip (N bodies = N-1 bones)
+            public float[] boneLengths;                // Length of each bone (N-1)
+            public float rootOffsetFromMidpoint;       // Compatibility/default rail side; negative=start, positive=end
+            [Tooltip("Persistent chain order on the authored spline. Use TowardStart/TowardEnd for stable ownership; Auto preserves old two-arm scenes.")]
+            public RailOrder railOrder;
+            public float slideSearchDistance;          // Temporal coherence window
+            public float maxSlideSpeed;                // Max rail speed per second
+            public float[] jointHertz;                 // Spring hertz per joint
+            public float[] jointDamping;               // Spring damping per joint
+            public Vector3[] hingeAxesLocal;           // Hinge axis in parent body local space (empty = spherical)
+            public float[] hingeLimitsDegrees;         // Hinge limits per joint (0 = no limit)
+            public int railIndex;                      // Which spline rail this chain belongs to (0 = first rail)
+        }
+
+        private struct BodyFrame
+        {
+            public float3 com;
+            public quaternion orientation;
+            public float3 forward;
+            public float3 right;          // Dynamic: torso shoulder-to-shoulder (for torso orientation)
+            public float3 up;
+            public float3 railCenter;     // Torso center projected onto rail
+        }
+
+        private readonly List<RailSample> rail = new List<RailSample>();
+        private readonly List<Joint> nativeJoints = new List<Joint>();
+        private readonly List<Body> bodies = new List<Body>();
+        private LimbRuntime[] runtime;
+        private Box3DWorld world;
+        private float railLength;
+        private float3 torsoComLocalToTorso;
+        private BodyFrame currentBodyFrame;
+        private float torsoTwistAngle;        // Tracked twist around shoulder axis (radians)
+        private bool torsoTwistInitialized;
+        private bool built;
+
+        // Backward compatibility: map old RailLimb[] to new LimbChain[]
+        [SerializeField] private LimbChain[] limbChains = Array.Empty<LimbChain>();
+
+        private void Start() => Rebuild();
+
+        private void FixedUpdate()
+        {
+            if (!built) return;
+            CacheRail(); // small fixed sample count: moving control points take effect immediately.
+            if (railLength <= 1e-4f) return;
+            ApplyTorsoGodControl();
+            DriveArticulation();
+        }
+
+        [ContextMenu("Rebuild")]
+        public void Rebuild()
+        {
+            DestroyJoints();
+            CacheRail();
+            built = false;
+            world = Box3DWorld.Instance;
+            
+            // Use new LimbChain system if available, fall back to old RailLimb
+            int chainCount = (limbChains != null && limbChains.Length > 0) ? limbChains.Length : limbs.Length;
+            if (!world || !world.World.IsValid || !torso || !torso.Body.IsValid || rail.Count < 2 || chainCount == 0)
+                return;
+
+            bodies.Add(torso.Body);
+            runtime = new LimbRuntime[chainCount];
+            
+            // Validate all bodies first
+            for (int i = 0; i < chainCount; i++)
+            {
+                var chain = (limbChains != null && limbChains.Length > 0) ? limbChains[i] : ConvertRailLimb(limbs[i]);
+                if (chain.bodies == null || chain.bodies.Length < 1)
+                {
+                    Debug.LogError($"{name}: Limb {i} needs at least 1 body (torso is added as root).", this);
+                    return;
+                }
+                for (int b = 0; b < chain.bodies.Length; b++)
+                {
+                    if (!chain.bodies[b] || !chain.bodies[b].Body.IsValid)
+                    {
+                        Debug.LogError($"{name}: Limb {i} body {b} is invalid.", this);
+                        return;
+                    }
+                    bodies.Add(chain.bodies[b].Body);
+                }
+            }
+
+            if (disableGravity)
+                foreach (Body body in bodies) body.SetGravityScale(0f);
+
+            // Torso COM in torso local space (for god controller target)
+            float3 torsoCom = torso.Body.GetWorldCenterOfMass();
+            torsoComLocalToTorso = math.mul(math.inverse(torso.Body.GetRotation()), torsoCom - (float3)torso.Body.GetPosition());
+
+            // Validate all rail allocations before creating any native joints. This keeps a failed
+            // rebuild reversible: there is never a half-created rig with invalid cart ordering.
+            if (!ValidateRailOwnership())
+                return;
+
+            for (int i = 0; i < chainCount; i++) CreateLimbChainJoints(i);
+            built = nativeJoints.Count > 0 && nativeJoints.TrueForAll(joint => joint.IsValid);
+            if (!built) Debug.LogError($"{name}: Box3D joint creation failed.", this);
+        }
+
+        private void CacheRail()
+        {
+            rail.Clear();
+            railLength = 0f;
+            if (controlPoints == null || controlPoints.Length < 2) return;
+
+            Transform first = controlPoints[0];
+            if (!first) return;
+            
+            // For Catmull-Rom we need at least 4 points. If fewer, fall back to linear.
+            bool useCatmullRom = controlPoints.Length >= 4;
+            
+            if (useCatmullRom)
+            {
+                // Precompute all control point positions
+                int n = controlPoints.Length;
+                float3[] points = new float3[n];
+                for (int i = 0; i < n; i++)
+                    points[i] = controlPoints[i] ? (float3)controlPoints[i].position : float3.zero;
+
+                // Add first point
+                rail.Add(new RailSample { s = 0f, position = points[0], tangent = math.normalizesafe(points[1] - points[0], math.right()) });
+
+                // Sample each segment using Catmull-Rom
+                for (int segment = 0; segment < n - 1; segment++)
+                {
+                    // Get 4 control points for this segment
+                    float3 p0 = points[math.max(0, segment - 1)];
+                    float3 p1 = points[segment];
+                    float3 p2 = points[segment + 1];
+                    float3 p3 = points[math.min(n - 1, segment + 2)];
+
+                    float3 previous = p1;
+                    for (int step = 1; step <= samplesPerSegment; step++)
+                    {
+                        float t = step / (float)samplesPerSegment;
+                        float3 point = CatmullRom(p0, p1, p2, p3, t);
+                        float distance = math.length(point - previous);
+                        if (distance <= 1e-5f) continue;
+                        railLength += distance;
+                        float3 tangent = CatmullRomTangent(p0, p1, p2, p3, t);
+                        rail.Add(new RailSample { s = railLength, position = point, tangent = math.normalizesafe(tangent, math.forward()) });
+                        previous = point;
+                    }
+                }
+            }
+            else
+            {
+                // Linear fallback for < 4 points
+                float3 previous = (float3)first.position;
+                rail.Add(new RailSample { s = 0f, position = previous, tangent = math.right() });
+                for (int segment = 0; segment < controlPoints.Length - 1; segment++)
+                {
+                    Transform a = controlPoints[segment];
+                    Transform b = controlPoints[segment + 1];
+                    if (!a || !b) continue;
+                    for (int step = 1; step <= samplesPerSegment; step++)
+                    {
+                        float3 point = math.lerp((float3)a.position, (float3)b.position, step / (float)samplesPerSegment);
+                        float distance = math.length(point - previous);
+                        if (distance <= 1e-5f) continue;
+                        railLength += distance;
+                        rail.Add(new RailSample { s = railLength, position = point, tangent = math.normalizesafe(point - previous, math.forward()) });
+                        previous = point;
+                    }
+                }
+            }
+
+            if (rail.Count > 1)
+            {
+                RailSample start = rail[0];
+                start.tangent = rail[1].tangent;
+                rail[0] = start;
+            }
+        }
+
+        // Catmull-Rom spline evaluation (uniform parameterization)
+        private static float3 CatmullRom(float3 p0, float3 p1, float3 p2, float3 p3, float t)
+        {
+            float t2 = t * t;
+            float t3 = t2 * t;
+            return 0.5f * (
+                2f * p1 +
+                (-p0 + p2) * t +
+                (2f * p0 - 5f * p1 + 4f * p2 - p3) * t2 +
+                (-p0 + 3f * p1 - 3f * p2 + p3) * t3
+            );
+        }
+
+        private static float3 CatmullRomTangent(float3 p0, float3 p1, float3 p2, float3 p3, float t)
+        {
+            float t2 = t * t;
+            return 0.5f * (
+                (-p0 + p2) +
+                2f * (2f * p0 - 5f * p1 + 4f * p2 - p3) * t +
+                3f * (-p0 + 3f * p1 - 3f * p2 + p3) * t2
+            );
+        }
+
+        private void CreateLimbChainJoints(int index)
+        {
+            // Support both legacy RailLimb and new LimbChain
+            LimbChain chain;
+            if (limbChains != null && limbChains.Length > index)
+            {
+                chain = limbChains[index];
+            }
+            else if (limbs != null && limbs.Length > index)
+            {
+                // Convert legacy RailLimb to LimbChain (2 bones)
+                RailLimb limb = limbs[index];
+                chain = new LimbChain
+                {
+                    bodies = new[] { limb.upperBody, limb.lowerBody },
+                    boneLengths = new[] { limb.upperLength, limb.lowerLength },
+                    rootOffsetFromMidpoint = limb.shoulderOffsetFromMidpoint,
+                    railOrder = limb.railOrder,
+                    slideSearchDistance = limb.slideSearchDistance,
+                    maxSlideSpeed = limb.maxSlideSpeed,
+                    jointHertz = new[] { limb.shoulderHertz, limb.elbowHertz },
+                    jointDamping = new[] { limb.shoulderDamping, limb.elbowDamping },
+                    // Joint 0 (shoulder) = spherical (zero hinge axis), Joint 1 (elbow) = hinge (bend plane normal)
+                    hingeAxesLocal = new[] { Vector3.zero, limb.bendPlaneNormalLocal },
+                    hingeLimitsDegrees = new[] { 0f, limb.elbowLimitDegrees }
+                };
+            }
+            else
+            {
+                return;
+            }
+
+            LimbRuntime state = runtime[index];
+            // Build full body chain including torso as root
+            Box3DBody[] fullBodies = new Box3DBody[chain.bodies.Length + 1];
+            fullBodies[0] = torso;
+            Array.Copy(chain.bodies, 0, fullBodies, 1, chain.bodies.Length);
+            
+            int numBones = fullBodies.Length - 1;
+            int numJoints = numBones;
+            
+            state.joints = new BoneJoint[numJoints];
+            state.localAnchors = new float3[numJoints];
+            state.boneLengths = chain.boneLengths;
+            state.jointS = new float[numJoints + 1]; // +1 for root
+            state.rootBodyRotation = torso.Body.GetRotation();
+            state.rootBodyPosition = torso.Body.GetPosition();
+            // Fixed body-local side direction: torso center > shoulder anchor
+            state.fixedSideDirLocal = math.normalizesafe(index == 0 ? leftShoulderLocalAnchor : rightShoulderLocalAnchor, math.right());
+            
+            // Create joints along the chain
+            for (int j = 0; j < numJoints; j++)
+            {
+                Box3DBody bodyA = fullBodies[j];
+                Box3DBody bodyB = fullBodies[j + 1];
+                
+                // World position of this joint (anchor on bodyA)
+                float3 jointPos;
+                if (j == 0)
+                {
+                    // Shoulder: at torso's shoulder anchor
+                    jointPos = ShoulderAnchorWorld(index);
+                }
+                else
+                {
+                    // Joint j connects bodyA (proximal) to bodyB (distal)
+                    // Position is at bodyA's distal end: bodyA center + (boneLength/2) * bodyA's down axis
+                    Box3DBody proximalBody = chain.bodies[j - 1];
+                    float boneLength = chain.boneLengths[j - 1];
+                    jointPos = proximalBody.transform.TransformPoint(Vector3.down * (boneLength * 0.5f));
+                }
+                
+                state.localAnchors[j] = math.mul(math.inverse(bodyA.Body.GetRotation()), jointPos - (float3)bodyA.Body.GetPosition());
+                
+                // Compute initial bone direction in bodyA local space (for drive target math)
+                float3 bodyBPos = bodyB.Body.GetPosition();
+                float3 boneDirWorld = math.normalizesafe(bodyBPos - jointPos, math.forward());
+                float3 boneAxisLocal = math.mul(math.inverse(bodyA.Body.GetRotation()), boneDirWorld);
+                
+                bool isHinge = chain.hingeAxesLocal.Length > j && math.lengthsq((float3)chain.hingeAxesLocal[j]) > 1e-6f;
+                float3 hingeAxis = isHinge ? math.normalize((float3)chain.hingeAxesLocal[j]) : float3.zero;
+                
+                if (isHinge)
+                {
+                    // Hinge joint: Z axis = hinge axis in WORLD space
+                    float3 worldHingeAxis = math.mul(bodyA.Body.GetRotation(), hingeAxis);
+                    quaternion hingeFrameRot = quaternion.LookRotationSafe(worldHingeAxis, math.up());
+                    
+                    RevoluteJointDef def = RevoluteJointDef.Default;
+                    SetupFrames(ref def.Base, bodyA.Body, bodyB.Body,
+                        new B3Transform { Position = jointPos, Rotation = hingeFrameRot },
+                        out state.joints[j].frameA, out state.joints[j].frameB);
+                    
+                    def.EnableSpring = true;
+                    def.Hertz = chain.jointHertz.Length > j ? chain.jointHertz[j] : 300f;
+                    def.DampingRatio = chain.jointDamping.Length > j ? chain.jointDamping[j] : 0.7f;
+                    
+                    if (!disableJointLimits && chain.hingeLimitsDegrees.Length > j && chain.hingeLimitsDegrees[j] > 0f)
+                    {
+                        def.EnableLimit = true;
+                        float limit = math.radians(chain.hingeLimitsDegrees[j]);
+                        def.LowerAngle = -limit;
+                        def.UpperAngle = limit;
+                    }
+                    else
+                    {
+                        def.EnableLimit = false;
+                    }
+                    
+                    state.joints[j].jointId = world.World.CreateRevoluteJoint(def).Id;
+                    state.joints[j].isHinge = true;
+                    state.joints[j].hingeAxisLocal = hingeAxis;
+                    state.joints[j].boneAxisLocal = boneAxisLocal;
+                    state.joints[j].hertz = def.Hertz;
+                    state.joints[j].damping = def.DampingRatio;
+                    state.joints[j].lowerLimit = def.LowerAngle;
+                    state.joints[j].upperLimit = def.UpperAngle;
+                }
+                else
+                {
+                    // Spherical joint: align joint frame Z with initial bone direction
+                    quaternion boneFrameRot = quaternion.LookRotationSafe(boneDirWorld, math.up());
+                    
+                    SphericalJointDef def = SphericalJointDef.Default;
+                    SetupFrames(ref def.Base, bodyA.Body, bodyB.Body,
+                        new B3Transform { Position = jointPos, Rotation = boneFrameRot },
+                        out state.joints[j].frameA, out state.joints[j].frameB);
+                    
+                    def.EnableSpring = true;
+                    // Stronger defaults for spherical (shoulder) joints
+                    def.Hertz = chain.jointHertz.Length > j ? chain.jointHertz[j] : 2000f;
+                    def.DampingRatio = chain.jointDamping.Length > j ? chain.jointDamping[j] : 1.0f;
+                    
+                    // Explicitly disable any cone/twist limits if API supports it
+                    // (SphericalJointDef may have EnableConeLimit, ConeAngle, TwistLimit fields)
+                    
+                    state.joints[j].jointId = world.World.CreateSphericalJoint(def).Id;
+                    state.joints[j].isHinge = false;
+                    state.joints[j].boneAxisLocal = boneAxisLocal;
+                    state.joints[j].hertz = def.Hertz;
+                    state.joints[j].damping = def.DampingRatio;
+                }
+                
+                nativeJoints.Add(new Joint { Id = state.joints[j].jointId });
+            }
+            
+            // Initialize with the same hard rail-order invariant used at runtime. A chain can never
+            // begin with a remote/crossed station and then attempt to correct itself on frame one.
+            RootInterval(index, chain, out float rootMinimum, out float rootMaximum);
+            if (rootMinimum > rootMaximum)
+            {
+                Debug.LogError($"{name}: chain {index} is longer than its assigned rail interval. " +
+                    "Increase the rail partition, shorten the chain, or reduce chainPartitionGap.", this);
+                return;
+            }
+
+            float rootS = Project(ShoulderAnchorWorld(index), rootMinimum, rootMaximum, out _);
+            ApplyOrderedStations(index, ref state, chain, rootS);
+            state.hasProjection = true;
+            runtime[index] = state;
+        }
+
+        private static float GetShoulderOffset(int limbIndex, LimbChain[] chains, RailLimb[] legacyLimbs)
+        {
+            if (chains != null && chains.Length > limbIndex)
+                return chains[limbIndex].rootOffsetFromMidpoint;
+            if (legacyLimbs != null && legacyLimbs.Length > limbIndex)
+                return legacyLimbs[limbIndex].shoulderOffsetFromMidpoint;
+            return 0f;
+        }
+
+        // The authored spline's start/end define the persistent ownership order.  This deliberately
+        // does not use world-space position, torso orientation, or a spline-side half-plane.
+        private int RailDirection(int chainIndex, LimbChain chain)
+        {
+            if (chain.railOrder == RailOrder.TowardStart) return -1;
+            if (chain.railOrder == RailOrder.TowardEnd) return 1;
+
+            // Existing two-chain scenes serialize Auto and their legacy offsets are magnitudes,
+            // not signed ownership data. Preserve the original convention deterministically:
+            // first chain owns spline start, second chain owns spline end. New authored chains
+            // should set TowardStart/TowardEnd explicitly rather than rely on this fallback.
+            return chainIndex == 0 ? -1 : 1;
+        }
+
+        private void ChainInterval(int chainIndex, LimbChain chain, out float minimum, out float maximum)
+        {
+            float split = railLength * 0.5f;
+            float halfGap = math.min(chainPartitionGap * 0.5f, split);
+            if (RailDirection(chainIndex, chain) < 0)
+            {
+                minimum = 0f;
+                maximum = math.max(0f, split - halfGap);
+            }
+            else
+            {
+                minimum = math.min(railLength, split + halfGap);
+                maximum = railLength;
+            }
+        }
+
+        private static float ChainLength(LimbChain chain)
+        {
+            float length = 0f;
+            if (chain.boneLengths == null) return length;
+            for (int i = 0; i < chain.boneLengths.Length; i++)
+                length += math.max(0f, chain.boneLengths[i]);
+            return length;
+        }
+
+        private void RootInterval(int chainIndex, LimbChain chain, out float minimum, out float maximum)
+        {
+            ChainInterval(chainIndex, chain, out minimum, out maximum);
+            float length = ChainLength(chain);
+            if (RailDirection(chainIndex, chain) < 0)
+                minimum += length; // children extend toward s = 0
+            else
+                maximum -= length; // children extend toward s = railLength
+        }
+
+        private void ApplyOrderedStations(int chainIndex, ref LimbRuntime state, LimbChain chain, float rootS)
+        {
+            ChainInterval(chainIndex, chain, out float chainMinimum, out float chainMaximum);
+            int direction = RailDirection(chainIndex, chain);
+            state.jointS[0] = math.clamp(rootS, chainMinimum, chainMaximum);
+            for (int j = 0; j < chain.boneLengths.Length; j++)
+                state.jointS[j + 1] = math.clamp(state.jointS[j] + direction * math.max(0f, chain.boneLengths[j]), chainMinimum, chainMaximum);
+        }
+
+        [ContextMenu("Validate Rail Ownership")]
+        private bool ValidateRailOwnership()
+        {
+            int chainCount = (limbChains != null && limbChains.Length > 0) ? limbChains.Length : limbs.Length;
+            bool valid = railLength > 1e-4f;
+            if (!valid)
+                Debug.LogError($"{name}: rail has no usable arc length.", this);
+
+            for (int i = 0; i < chainCount; i++)
+            {
+                LimbChain chain = (limbChains != null && limbChains.Length > 0) ? limbChains[i] : ConvertRailLimb(limbs[i]);
+                ChainInterval(i, chain, out float chainMinimum, out float chainMaximum);
+                RootInterval(i, chain, out float rootMinimum, out float rootMaximum);
+                float chainLength = ChainLength(chain);
+
+                if (chain.boneLengths == null || chain.bodies == null || chain.bodies.Length != chain.boneLengths.Length)
+                {
+                    Debug.LogError($"{name}: chain {i} requires one body and one positive bone length per rail segment.", this);
+                    valid = false;
+                    continue;
+                }
+
+                if (chainLength > chainMaximum - chainMinimum + 1e-4f || rootMinimum > rootMaximum)
+                {
+                    Debug.LogError($"{name}: chain {i} length ({chainLength:F3}) exceeds its persistent rail domain " +
+                        $"[{chainMinimum:F3}, {chainMaximum:F3}] (length {chainMaximum - chainMinimum:F3}).", this);
+                    valid = false;
+                }
+            }
+            return valid;
+        }
+
+        private void ApplyTorsoGodControl()
+        {
+            float dt = Time.fixedDeltaTime;
+            
+            // Desired COM position: fixed shoulder stations on spline
+            float middle = railLength * 0.5f;
+            int chainCount = (limbChains != null && limbChains.Length > 0) ? limbChains.Length : limbs.Length;
+            float leftOffset = math.abs(GetShoulderOffset(0, limbChains, limbs));
+            float rightOffset = math.abs(GetShoulderOffset(math.min(1, chainCount - 1), limbChains, limbs));
+            float leftS = math.clamp(middle - leftOffset, 0f, railLength);
+            float rightS = math.clamp(middle + rightOffset, 0f, railLength);
+            RailSample leftFixed = Sample(leftS);
+            RailSample rightFixed = Sample(rightS);
+            
+            // Desired torso position: shoulders at fixed spline stations, using CURRENT torso rotation
+            quaternion currentTorsoRotation = torso.Body.GetRotation();
+            float3 localMid = (leftShoulderLocalAnchor + rightShoulderLocalAnchor) * 0.5f;
+            float3 targetMid = (leftFixed.position + rightFixed.position) * 0.5f;
+            float3 desiredTorsoPosition = targetMid - math.mul(currentTorsoRotation, localMid);
+            float3 desiredCom = desiredTorsoPosition + math.mul(currentTorsoRotation, torsoComLocalToTorso);
+
+            // Dynamic rotation target: align torso with DYNAMICALLY PROJECTED shoulder positions
+            // (from previous frame's UpdateCorrespondence - provides temporal coherence)
+            float3 dynamicLeftPos = leftFixed.position;
+            float3 dynamicRightPos = rightFixed.position;
+            if (built && runtime != null && runtime.Length >= 2 && runtime[0].hasProjection && runtime[1].hasProjection)
+            {
+                dynamicLeftPos = Sample(runtime[0].shoulderS).position;
+                dynamicRightPos = Sample(runtime[1].shoulderS).position;
+            }
+            float3 dynamicShoulderDir = math.normalizesafe(dynamicRightPos - dynamicLeftPos, math.right());
+            float3 localShoulderDir = math.normalizesafe(rightShoulderLocalAnchor - leftShoulderLocalAnchor, math.right());
+            quaternion shoulderAlign = ShortestArcRotation(localShoulderDir, dynamicShoulderDir);
+            
+            // ---- Temporally stabilized twist around shoulder axis ----
+            // Compute "upright" target twist (aligns local up with world up as much as possible)
+            float3 localUp = math.normalizesafe(math.cross(localShoulderDir, math.up()), math.up());
+            float3 rotatedLocalUp = math.mul(shoulderAlign, localUp);
+            float3 planeUp = math.normalizesafe(math.up() - dynamicShoulderDir * math.dot(math.up(), dynamicShoulderDir), math.up());
+            float3 planeLocalUp = math.normalizesafe(rotatedLocalUp - dynamicShoulderDir * math.dot(rotatedLocalUp, dynamicShoulderDir), math.up());
+            quaternion uprightTwist = ShortestArcRotation(planeLocalUp, planeUp);
+            
+            // Extract twist angle from uprightTwist around dynamicShoulderDir
+            float uprightTwistAngle = 0f;
+            if (math.lengthsq(uprightTwist.value.xyz) > 1e-6f)
+            {
+                float3 axis = math.normalize(uprightTwist.value.xyz);
+                float angle = 2f * math.acos(math.clamp(uprightTwist.value.w, -1f, 1f));
+                // Ensure axis aligns with shoulder dir (or opposite)
+                if (math.dot(axis, dynamicShoulderDir) < 0f) angle = -angle;
+                uprightTwistAngle = angle;
+            }
+            
+            // Extract current twist angle from actual torso rotation
+            float currentTwistAngle = ExtractTwistAngle(torso.Body.GetRotation(), shoulderAlign, dynamicShoulderDir);
+            
+            // Initialize or smooth tracked twist angle
+            if (!torsoTwistInitialized)
+            {
+                torsoTwistAngle = currentTwistAngle;
+                torsoTwistInitialized = true;
+            }
+            else
+            {
+                // Spring-damper on 1D twist angle (critically damped, responsive)
+                const float twistHertz = 8f;
+                const float twistDamping = 1.0f;
+                float omega = 2f * math.PI * twistHertz;
+                float omega2 = omega * omega;
+                float twoZetaOmega = 2f * twistDamping * omega;
+                
+                // Shortest angular difference
+                float error = math.fmod(uprightTwistAngle - torsoTwistAngle + math.PI, 2f * math.PI) - math.PI;
+                
+                // Semi-implicit Euler on twist angle
+                float accel = omega2 * error - twoZetaOmega * 0f; // no velocity state for simplicity
+                torsoTwistAngle += error * math.min(1f, omega * dt * 4f); // direct proportional step with rate limit
+                
+                // Wrap to [-PI, PI]
+                torsoTwistAngle = math.fmod(torsoTwistAngle + math.PI, 2f * math.PI) - math.PI;
+            }
+            
+            // Reconstruct twist quaternion from smoothed angle
+            quaternion smoothedTwist = quaternion.AxisAngle(dynamicShoulderDir, torsoTwistAngle);
+            quaternion dynamicTorsoRotation = math.mul(smoothedTwist, shoulderAlign);
+
+            // Update body frame for side projection (uses TORSO orientation, not aggregate)
+            quaternion torsoRotation = torso.Body.GetRotation();
+            float3 torsoCom = torso.Body.GetWorldCenterOfMass();
+            float3 torsoPosition = torsoCom - math.mul(torsoRotation, torsoComLocalToTorso);
+            float3 torsoVelocity = torso.Body.GetLinearVelocity();
+            float3 torsoAngularVelocity = torso.Body.GetAngularVelocity();
+            
+            // World-space shoulder-to-shoulder direction (used for side projection)
+            localShoulderDir = math.normalizesafe(rightShoulderLocalAnchor - leftShoulderLocalAnchor, math.right());
+            float3 worldShoulderDir = math.normalizesafe(math.mul(torsoRotation, localShoulderDir), math.right());
+            
+            // Project torso center onto rail for side-projection centerline
+            float3 torsoRailCenter;
+            float torsoRailS = Project(torsoPosition, 0f, railLength, out torsoRailCenter);
+            
+            currentBodyFrame = new BodyFrame
+            {
+                com = torsoCom,
+                orientation = torsoRotation,
+                forward = math.normalizesafe(math.mul(torsoRotation, math.forward()), math.forward()),
+                right = worldShoulderDir,  // Use actual shoulder axis for side test
+                up = math.normalizesafe(math.mul(torsoRotation, math.up()), math.up()),
+                railCenter = torsoRailCenter
+            };
+
+            float3 force = ClampMagnitude(positionGain * (desiredCom - torsoCom) - velocityGain * torsoVelocity, maxForce);
+            float3 torque = ClampMagnitude(orientationGain * RotationVector(math.mul(dynamicTorsoRotation, math.inverse(torsoRotation))) - angularVelocityGain * torsoAngularVelocity, maxTorque);
+
+            torso.Body.ApplyForceToCenter(force, wake: true);
+            torso.Body.ApplyTorque(torque, wake: true);
+        }
+
+        private float ExtractTwistAngle(quaternion rotation, quaternion shoulderAlign, float3 shoulderAxis)
+        {
+            // rotation = twist * shoulderAlign
+            // twist = rotation * inverse(shoulderAlign)
+            quaternion twist = math.mul(rotation, math.inverse(shoulderAlign));
+            // Project twist onto shoulder axis
+            float3 axis = math.normalize(twist.value.xyz);
+            float angle = 2f * math.acos(math.clamp(twist.value.w, -1f, 1f));
+            if (math.dot(axis, shoulderAxis) < 0f) angle = -angle;
+            return angle;
+        }
+
+        private void DriveArticulation()
+        {
+            float dt = Time.fixedDeltaTime;
+            quaternion currentTorsoRotation = torso.Body.GetRotation();
+            float3 currentTorsoPosition = torso.Body.GetWorldCenterOfMass() - math.mul(currentTorsoRotation, torsoComLocalToTorso);
+            
+            int chainCount = (limbChains != null && limbChains.Length > 0) ? limbChains.Length : limbs.Length;
+            for (int i = 0; i < chainCount; i++)
+            {
+                LimbChain chain = (limbChains != null && limbChains.Length > 0) ? limbChains[i] : ConvertRailLimb(limbs[i]);
+                LimbRuntime state = runtime[i];
+                
+                // Update rail coordinate correspondences with proper 1D FABRIK solver
+                UpdateCorrespondenceWithSolver(i, ref state, chain, dt);
+                
+                // Apply joint drive targets from rail positions
+                ApplyJointDriveTargets(i, ref state, chain, currentTorsoRotation, currentTorsoPosition, dt);
+                
+                if (drawTargets)
+                {
+                    // Draw solved rail positions as debug lines
+                    float3[] jointPositions = new float3[state.jointS.Length];
+                    for (int j = 0; j < state.jointS.Length; j++)
+                    {
+                        RailSample sample = Sample(state.jointS[j]);
+                        jointPositions[j] = sample.position + math.up() * 0.01f;
+                    }
+                    for (int j = 0; j < jointPositions.Length - 1; j++)
+                    {
+                        Debug.DrawLine(jointPositions[j], jointPositions[j + 1], Color.blue);
+                    }
+                }
+                
+                runtime[i] = state;
+            }
+        }
+
+        /// <summary>
+        /// Update rail correspondences: project root & tip anchors, rate-limit,
+        /// then solve intermediate joints with 1D FABRIK on the rail.
+        /// Works for arbitrary chain lengths (N bones, N+1 joints).
+        /// </summary>
+        private void UpdateCorrespondenceWithSolver(int limbIndex, ref LimbRuntime state, LimbChain chain, float dt)
+        {
+            // A chain owns a persistent interval of the authored s = 0 -> railLength ordering.
+            // Project only its root into the interval in which the complete chain fits, then derive
+            // every child from signed arc-length offsets. This makes crossing physically impossible.
+            RootInterval(limbIndex, chain, out float rootMinimum, out float rootMaximum);
+            if (rootMinimum > rootMaximum)
+            {
+                Debug.LogError($"{name}: chain {limbIndex} is longer than its assigned rail interval. " +
+                    "Increase the rail partition, shorten the chain, or reduce chainPartitionGap.", this);
+                return;
+            }
+
+            float targetRootS = Project(ShoulderAnchorWorld(limbIndex), rootMinimum, rootMaximum, out _);
+            float step = math.max(0f, chain.maxSlideSpeed) * dt;
+            float rootS = math.clamp(MoveAlongRail(state.jointS[0], targetRootS, step), rootMinimum, rootMaximum);
+            ApplyOrderedStations(limbIndex, ref state, chain, rootS);
+            state.hasProjection = true;
+        }
+
+        private float ShoulderStation(int limbIndex)
+        {
+            float offset = math.abs(GetShoulderOffset(limbIndex, limbChains, limbs));
+            return math.clamp(railLength * 0.5f + (limbIndex == 0 ? -offset : offset), 0f, railLength);
+        }
+
+        private quaternion DesiredTorsoFrame()
+        {
+            float middle = railLength * .5f;
+            float leftS = math.clamp(middle - math.abs(GetShoulderOffset(0, limbChains, limbs)), 0f, railLength);
+            float rightS = math.clamp(middle + math.abs(GetShoulderOffset(math.min(1, limbChains != null && limbChains.Length > 0 ? limbChains.Length : limbs.Length - 1), limbChains, limbs)), 0f, railLength);
+            RailSample left = Sample(leftS);
+            RailSample right = Sample(rightS);
+
+            // Desired world positions for the two shoulder anchors
+            float3 targetLeft = left.position;
+            float3 targetRight = right.position;
+            
+            // Local shoulder anchors on torso
+            float3 localLeft = leftShoulderLocalAnchor;
+            float3 localRight = rightShoulderLocalAnchor;
+            
+            // Solve for rigid transform that maps local anchors to target positions
+            // Translation: align midpoints
+            float3 localMid = (localLeft + localRight) * 0.5f;
+            float3 targetMid = (targetLeft + targetRight) * 0.5f;
+            
+            // Rotation: align local shoulder vector to target shoulder vector
+            float3 localShoulderDir = math.normalizesafe(localRight - localLeft, math.right());
+            float3 targetShoulderDir = math.normalizesafe(targetRight - targetLeft, math.right());
+            
+            // Find rotation that maps localShoulderDir -> targetShoulderDir
+            // Using shortest-arc quaternion formula
+            quaternion shoulderAlign = ShortestArcRotation(localShoulderDir, targetShoulderDir);
+            
+            // Now we need to choose the twist around the shoulder axis.
+            // Pick the twist that makes the body's up axis as close to world up as possible.
+            float3 localUp = math.normalizesafe(math.cross(localShoulderDir, new float3(0, 1, 0)), math.up());
+            if (math.lengthsq(localUp) < 1e-4f) localUp = math.normalizesafe(math.cross(localShoulderDir, new float3(0, 0, 1)), math.up());
+            float3 rotatedLocalUp = math.mul(shoulderAlign, localUp);
+            
+            // Twist around targetShoulderDir to align rotatedLocalUp with world up
+            float3 targetUp = math.up();
+            // Project both onto plane perpendicular to targetShoulderDir
+            float3 planeUp = math.normalizesafe(targetUp - targetShoulderDir * math.dot(targetUp, targetShoulderDir), math.up());
+            float3 planeLocalUp = math.normalizesafe(rotatedLocalUp - targetShoulderDir * math.dot(rotatedLocalUp, targetShoulderDir), math.up());
+            
+            quaternion twist = ShortestArcRotation(planeLocalUp, planeUp);
+            
+            quaternion finalRotation = math.mul(twist, shoulderAlign);
+            
+            return finalRotation;
+        }
+
+        private static quaternion ShortestArcRotation(float3 from, float3 to)
+        {
+            from = math.normalizesafe(from, math.forward());
+            to = math.normalizesafe(to, math.forward());
+            float dot = math.dot(from, to);
+            if (dot > 1f - 1e-6f) return quaternion.identity;
+            float3 axis = from;
+            if (dot < -1f + 1e-6f)
+            {
+                // 180 degree rotation: pick any perpendicular axis
+                axis = math.normalizesafe(math.cross(from, math.up()), math.right());
+                return quaternion.AxisAngle(axis, math.PI);
+            }
+            axis = math.normalize(math.cross(from, to));
+            float angle = math.acos(dot);
+            return quaternion.AxisAngle(axis, angle);
+        }
+
+        // Project a point to the rail, considering ONLY stations on the correct side of the
+        // body centerline (torso rail projection). Searches the ENTIRE rail.
+        // When the side test doesn't discriminate (straight rail), a per-limb shoulder
+        // station bias breaks the tie so left/right limbs don't collapse together.
+        // Optional unwrappingBias: if true, prefers s on the natural side of shoulderStationS
+        // (left arm: s < shoulderStationS; right arm: s > shoulderStationS).
+// Legacy windowed version kept for compatibility (unused now)
+        private static float MoveAlongRail(float from, float to, float maxDelta)
+        {
+            return math.abs(to - from) <= maxDelta ? to : from + math.sign(to - from) * maxDelta;
+        }
+
+        private static float3 SegmentDirection(RailSample start, RailSample end)
+        {
+            // Tangents are the primary pose target; chord direction is only a stable fallback for
+            // opposing/degenerate tangents on a sharply folded rail.
+            float3 tangentDirection = start.tangent + end.tangent;
+            return math.normalizesafe(tangentDirection, math.normalizesafe(end.position - start.position, math.down()));
+        }
+
+        private float Project(float3 point, float minimum, float maximum, out float3 projectedPoint)
+        {
+            minimum = math.clamp(minimum, 0f, railLength);
+            maximum = math.clamp(maximum, 0f, railLength);
+            if (minimum > maximum) { float temp = minimum; minimum = maximum; maximum = temp; }
+            float bestDistanceSq = float.MaxValue;
+            float bestS = minimum;
+            projectedPoint = Sample(minimum).position;
+            for (int i = 1; i < rail.Count; i++)
+            {
+                RailSample a = rail[i - 1]; RailSample b = rail[i];
+                if (b.s < minimum || a.s > maximum) continue;
+                float3 segment = b.position - a.position;
+                float t = math.saturate(math.dot(point - a.position, segment) / math.max(1e-6f, math.lengthsq(segment)));
+                float s = math.lerp(a.s, b.s, t);
+                if (s < minimum || s > maximum) continue;
+                float3 candidate = math.lerp(a.position, b.position, t);
+                float distanceSq = math.lengthsq(point - candidate);
+                if (distanceSq < bestDistanceSq) { bestDistanceSq = distanceSq; bestS = s; projectedPoint = candidate; }
+            }
+            return bestS;
+        }
+
+        private RailSample Sample(float s)
+        {
+            s = math.clamp(s, 0f, railLength);
+            int i = 1;
+            while (i < rail.Count && rail[i].s < s) i++;
+            if (i >= rail.Count) return rail[rail.Count - 1];
+            RailSample a = rail[i - 1]; RailSample b = rail[i];
+            float t = math.saturate((s - a.s) / math.max(1e-5f, b.s - a.s));
+            return new RailSample { s = s, position = math.lerp(a.position, b.position, t), tangent = math.normalizesafe(math.lerp(a.tangent, b.tangent, t), a.tangent) };
+        }
+
+        private float3 ShoulderAnchorWorld(int limbIndex) => torso.transform.TransformPoint(limbIndex == 0 ? leftShoulderLocalAnchor : rightShoulderLocalAnchor);
+        private static quaternion HingeFrameRotation(Vector3 hingeAxisLocal, Quaternion upperBodyRotation)
+        {
+            float3 worldAxis = math.mul((quaternion)upperBodyRotation, math.normalize((float3)hingeAxisLocal));
+            // Forward = hinge axis (so Z = hinge axis), Up = world up (arbitrary perpendicular)
+            return quaternion.LookRotationSafe(worldAxis, math.up());
+        }
+
+        private static quaternion ComputeBonePose(float3 boneDir, float3 worldHingeAxis, quaternion shoulderFrameA, quaternion elbowFrameA, quaternion torsoRotation)
+        {
+            // Joint frames at creation (captured in CreateLimbJoints):
+            //   shoulderFrameA = inverse(upperArmCreation) * torsoCreation
+            //   elbowFrameA   = inverse(upperArmCreation) * hingeFrameCreation  (Z = hinge axis)
+            // 
+            // Upper arm's local axes in its own local space:
+            //   localForward    = forward (0,0,1) by definition
+            //   localHingeAxis  = elbowFrameA * forward  (hinge axis expressed in upper arm local space)
+            // 
+            // Base upper arm world rotation (maintaining creation-relative pose to torso):
+            //   baseRotation = torsoRotation * inverse(shoulderFrameA)
+            // 
+            // We need boneLocalRotation (in upper arm local space) such that:
+            //   baseRotation * boneLocalRotation * localForward   = boneDir
+            //   baseRotation * boneLocalRotation * localHingeAxis = worldHingeAxis
+            // 
+            // => boneLocalRotation rotates localHingeAxis->targetHingeAxis, then twists to align localForward->targetForward
+            
+            float3 localForward = math.forward();
+            float3 localHingeAxis = math.mul(elbowFrameA, math.forward());
+            
+            quaternion baseRotation = math.mul(torsoRotation, math.inverse(shoulderFrameA));
+            quaternion invBase = math.inverse(baseRotation);
+            
+            float3 targetHingeAxis = math.mul(invBase, worldHingeAxis);
+            float3 targetForward = math.mul(invBase, boneDir);
+            
+            // Align localHingeAxis with targetHingeAxis
+            quaternion alignHinge = ShortestArcRotation(localHingeAxis, targetHingeAxis);
+            
+            // Twist around targetHingeAxis to align forward
+            float3 alignedForward = math.mul(alignHinge, localForward);
+            float3 planeForward = math.normalizesafe(targetForward - targetHingeAxis * math.dot(targetForward, targetHingeAxis), math.forward());
+            float3 planeAligned = math.normalizesafe(alignedForward - targetHingeAxis * math.dot(alignedForward, targetHingeAxis), math.forward());
+            quaternion twist = ShortestArcRotation(planeAligned, planeForward);
+            
+            // boneLocalRotation = twist * alignHinge (applied in upper arm local space)
+            quaternion boneLocalRotation = math.mul(twist, alignHinge);
+            
+            // upperArmWorld = baseRotation * boneLocalRotation = torsoRotation * inverse(shoulderFrameA) * boneLocalRotation
+            return math.mul(baseRotation, boneLocalRotation);
+        }
+
+                private static quaternion ComputeLowerArmPose(float3 boneDir, float3 worldHingeAxis, quaternion elbowFrameB, quaternion torsoRotation, Vector3 bendPlaneNormalLocal)
+        {
+            // Joint frame at creation:
+            //   elbowFrameB = inverse(lowerArmCreation) * hingeFrameCreation  (Z = hinge axis)
+            // 
+            // Lower arm's local axes in its own local space:
+            //   localForward    = forward (0,0,1) by definition
+            //   localHingeAxis  = elbowFrameB * forward  (hinge axis in lower arm local space)
+            // 
+            // Hinge frame world rotation (Z = worldHingeAxis):
+            quaternion hingeFrameWorld = HingeFrameRotation(bendPlaneNormalLocal, torsoRotation);
+            // Base lower arm world rotation (maintaining creation-relative pose to hinge frame):
+            quaternion baseRotation = math.mul(hingeFrameWorld, math.inverse(elbowFrameB));
+            
+            // The hinge axis is already aligned: baseRotation * localHingeAxis = worldHingeAxis
+            // We only need to twist around localHingeAxis to align localForward with boneDir.
+            // 
+            // Target forward in lower arm local space:
+            float3 targetForwardLocal = math.mul(math.inverse(baseRotation), boneDir);
+            float3 localForward = math.forward();
+            float3 localHingeAxis = math.mul(elbowFrameB, math.forward());
+            
+            // Project both onto plane perpendicular to localHingeAxis
+            float3 planeTarget = math.normalizesafe(targetForwardLocal - localHingeAxis * math.dot(targetForwardLocal, localHingeAxis), math.forward());
+            float3 planeForward = math.normalizesafe(localForward - localHingeAxis * math.dot(localForward, localHingeAxis), math.forward());
+            
+            // Twist around localHingeAxis
+            quaternion twist = ShortestArcRotation(planeForward, planeTarget);
+            
+            // lowerArmWorld = baseRotation * twist
+            return math.mul(baseRotation, twist);
+        }
+
+        private void AggregateState(out float mass, out float3 com, out float3 velocity, out quaternion orientation, out float3 angularVelocity)
+        {
+            mass = 0f; com = velocity = angularVelocity = float3.zero;
+            quaternion reference = torso.Body.GetRotation(); float4 orientationSum = float4.zero;
+            foreach (Body body in bodies)
+            {
+                float bodyMass = body.GetMass(); if (bodyMass <= 1e-5f) continue;
+                mass += bodyMass; com += bodyMass * (float3)body.GetWorldCenterOfMass(); velocity += bodyMass * body.GetLinearVelocity(); angularVelocity += bodyMass * body.GetAngularVelocity();
+                quaternion q = body.GetRotation(); if (math.dot(q.value, reference.value) < 0f) q.value = -q.value; orientationSum += bodyMass * q.value;
+            }
+            if (mass <= 1e-5f) { orientation = reference; currentBodyFrame = new BodyFrame { com = com, orientation = reference, forward = math.forward(), right = math.right(), up = math.up() }; return; }
+            com /= mass; velocity /= mass; angularVelocity /= mass; orientation = math.normalizesafe(new quaternion(orientationSum / mass), reference);
+            currentBodyFrame = new BodyFrame
+            {
+                com = com,
+                orientation = orientation,
+                forward = math.normalizesafe(math.mul(orientation, math.forward()), math.forward()),
+                right = math.normalizesafe(math.mul(orientation, math.right()), math.right()),
+                up = math.normalizesafe(math.mul(orientation, math.up()), math.up())
+            };
+        }
+
+        private static quaternion RelativeTarget(quaternion parentPose, quaternion childPose, B3Transform localA, B3Transform localB) => math.mul(math.inverse(math.mul(parentPose, localA.Rotation)), math.mul(childPose, localB.Rotation));
+        private static float SignedTwistZ(quaternion q) { q = math.normalizesafe(q, quaternion.identity); return 2f * math.atan2(q.value.z, q.value.w); }
+        private static float3 RotationVector(quaternion q) { q = math.normalizesafe(q, quaternion.identity); if (q.value.w < 0f) q.value = -q.value; float sine = math.length(q.value.xyz); return sine < 1e-5f ? 2f * q.value.xyz : q.value.xyz * (2f * math.atan2(sine, q.value.w) / sine); }
+        private static float3 ClampMagnitude(float3 value, float maximum) { float length = math.length(value); return length > maximum && length > 1e-5f ? value * (maximum / length) : value; }
+
+        private static void SetupFrames(ref JointDefBase def, Body a, Body b, B3Transform worldFrame, out B3Transform localA, out B3Transform localB)
+        {
+            def.BodyIdA = a.Id; def.BodyIdB = b.Id; def.CollideConnected = false;
+            localA = ToLocal(a, worldFrame); localB = ToLocal(b, worldFrame); def.LocalFrameA = localA; def.LocalFrameB = localB;
+        }
+        private static B3Transform ToLocal(Body body, B3Transform worldFrame) { quaternion q = body.GetRotation(); return new B3Transform { Position = math.mul(math.inverse(q), (float3)(worldFrame.Position - body.GetPosition())), Rotation = math.mul(math.inverse(q), worldFrame.Rotation) }; }
+
+        private void DestroyJoints()
+        {
+            foreach (Joint joint in nativeJoints) if (joint.IsValid) joint.Destroy(wakeAttached: false);
+            nativeJoints.Clear();
+            bodies.Clear();
+            runtime = null;
+        }
+
+        private void OnDisable() { DestroyJoints(); built = false; }
+
+        /// <summary>
+        /// Convert legacy RailLimb to new LimbChain format for backward compatibility.
+        /// </summary>
+        private static LimbChain ConvertRailLimb(RailLimb limb)
+        {
+            return new LimbChain
+            {
+                bodies = new[] { limb.upperBody, limb.lowerBody },
+                boneLengths = new[] { limb.upperLength, limb.lowerLength },
+                rootOffsetFromMidpoint = limb.shoulderOffsetFromMidpoint,
+                railOrder = limb.railOrder,
+                slideSearchDistance = limb.slideSearchDistance,
+                maxSlideSpeed = limb.maxSlideSpeed,
+                jointHertz = new[] { limb.shoulderHertz, limb.elbowHertz },
+                jointDamping = new[] { limb.shoulderDamping, limb.elbowDamping },
+                hingeAxesLocal = new[] { limb.bendPlaneNormalLocal, Vector3.zero },
+                hingeLimitsDegrees = new[] { 0f, limb.elbowLimitDegrees }
+            };
+        }
+
+        /// <summary>
+        /// Apply joint drive targets from solved rail positions.
+        /// </summary>
+        private void ApplyJointDriveTargets(int limbIndex, ref LimbRuntime state, LimbChain chain, quaternion currentTorsoRotation, float3 currentTorsoPosition, float dt)
+        {
+            int numJoints = state.joints.Length;
+            if (numJoints == 0) return;
+
+            float3[] jointPositions = new float3[numJoints + 1];
+            for (int j = 0; j <= numJoints; j++)
+            {
+                RailSample sample = Sample(state.jointS[j]);
+                jointPositions[j] = sample.position;
+            }
+
+            quaternion parentPose = currentTorsoRotation; // Joint 0 parent is torso
+            for (int j = 0; j < numJoints; j++)
+            {
+                BoneJoint boneJoint = state.joints[j];
+                // Joint 0: parentPos = shoulder anchor (not torso center!)
+                // Other joints: parentPos = previous joint rail position
+                float3 parentPos;
+                if (j == 0)
+                {
+                    // Shoulder anchor in world space (same as joint creation)
+                    parentPos = ShoulderAnchorWorld(limbIndex);
+                }
+                else
+                {
+                    parentPos = jointPositions[j];
+                }
+                float3 childPos = jointPositions[j + 1];
+                float3 boneDir = math.normalizesafe(childPos - parentPos, math.forward());
+
+                quaternion targetRotation;
+                if (boneJoint.isHinge)
+                {
+                    float3 worldHingeAxis = math.mul(parentPose, boneJoint.hingeAxisLocal);
+                    targetRotation = ComputeBonePoseGeneric(boneDir, worldHingeAxis, boneJoint.frameA.Rotation, parentPose, boneJoint.boneAxisLocal);
+                }
+                else
+                {
+                    targetRotation = ComputeBonePoseGeneric(boneDir, float3.zero, boneJoint.frameA.Rotation, parentPose, boneJoint.boneAxisLocal);
+                }
+
+                JointDriveTarget(boneJoint.jointId, parentPose, targetRotation, boneJoint.frameA, boneJoint.frameB, boneJoint.hertz, boneJoint.damping, boneJoint.isHinge);
+
+                // This joint's target becomes parent for next joint
+                parentPose = targetRotation;
+            }
+        }
+
+        private static quaternion ComputeBonePoseGeneric(float3 boneDir, float3 worldHingeAxis, quaternion jointFrameARotation, quaternion parentPose, float3 boneAxisLocal)
+        {
+            quaternion baseRotation = math.mul(parentPose, math.inverse(jointFrameARotation));
+            quaternion invBase = math.inverse(baseRotation);
+
+            float3 targetBoneAxis = math.mul(invBase, boneDir);
+
+            if (math.lengthsq(worldHingeAxis) < 1e-6f)
+            {
+                // Spherical: align boneAxisLocal to targetBoneAxis
+                quaternion align = ShortestArcRotation(boneAxisLocal, targetBoneAxis);
+                return math.mul(baseRotation, align);
+            }
+
+            float3 targetHingeAxis = math.mul(invBase, worldHingeAxis);
+            // In joint frame A, the hinge axis IS the Z axis (forward) by construction
+            float3 localHingeAxis = math.forward();
+
+            quaternion alignHinge = ShortestArcRotation(localHingeAxis, targetHingeAxis);
+            float3 alignedBoneAxis = math.mul(alignHinge, boneAxisLocal);
+            float3 planeBoneAxis = math.normalizesafe(targetBoneAxis - targetHingeAxis * math.dot(targetBoneAxis, targetHingeAxis), math.forward());
+            float3 planeAligned = math.normalizesafe(alignedBoneAxis - targetHingeAxis * math.dot(alignedBoneAxis, targetHingeAxis), math.forward());
+            quaternion twist = ShortestArcRotation(planeAligned, planeBoneAxis);
+
+            return math.mul(baseRotation, math.mul(twist, alignHinge));
+        }
+
+        private static void JointDriveTarget(JointId jointId, quaternion parentPose, quaternion childPose, B3Transform frameA, B3Transform frameB, float hertz, float damping, bool isHinge)
+        {
+            quaternion relativeTarget = RelativeTarget(parentPose, childPose, frameA, frameB);
+            if (isHinge)
+            {
+                var revolute = new RevoluteJoint { Id = jointId };
+                revolute.SetTargetAngle(SignedTwistZ(relativeTarget));
+                revolute.SetSpringHertz(hertz);
+                revolute.SetSpringDampingRatio(damping);
+            }
+            else
+            {
+                var spherical = new SphericalJoint { Id = jointId };
+                spherical.SetTargetRotation(relativeTarget);
+                spherical.SetSpringHertz(hertz);
+                spherical.SetSpringDampingRatio(damping);
+            }
+        }
+
+        private void OnDrawGizmos()
+        {
+            if (!drawRail) return;
+
+            if (rail.Count > 1)
+            {
+                Gizmos.color = Color.cyan;
+                var positions = new Vector3[rail.Count];
+                for (int i = 0; i < rail.Count; i++)
+                    positions[i] = (Vector3)rail[i].position;
+                Gizmos.DrawLineStrip(positions, false);
+            }
+            if (rail.Count > 1)
+            {
+                float split = railLength * 0.5f;
+                float halfGap = math.min(chainPartitionGap * 0.5f, split);
+                Gizmos.color = Color.magenta;
+                Gizmos.DrawWireSphere(Sample(split - halfGap).position, 0.035f);
+                Gizmos.DrawWireSphere(Sample(split + halfGap).position, 0.035f);
+
+                int chainCount = (limbChains != null && limbChains.Length > 0) ? limbChains.Length : limbs.Length;
+                for (int i = 0; i < chainCount; i++)
+                {
+                    LimbChain chain = (limbChains != null && limbChains.Length > 0) ? limbChains[i] : ConvertRailLimb(limbs[i]);
+                    RootInterval(i, chain, out float rootMinimum, out float rootMaximum);
+                    if (rootMinimum > rootMaximum) continue;
+                    Gizmos.color = RailDirection(i, chain) < 0 ? Color.blue : Color.red;
+                    Gizmos.DrawWireSphere(Sample(rootMinimum).position, 0.025f);
+                    Gizmos.DrawWireSphere(Sample(rootMaximum).position, 0.025f);
+                }
+            }
+            if (controlPoints != null)
+            {
+                Gizmos.color = Color.yellow;
+                for (int i = 0; i < controlPoints.Length; i++)
+                    if (controlPoints[i])
+                        Gizmos.DrawWireSphere(controlPoints[i].position, 0.05f);
+            }
+        }
+    }
+}

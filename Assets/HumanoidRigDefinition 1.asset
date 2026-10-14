@@ -1,0 +1,87 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 83bb10f525d106e4286b06ab4a8dc98d, type: 3}
+  m_Name: HumanoidRigDefinition 1
+  m_EditorClassIdentifier: HumanoidRig::HumanoidRig.HumanoidRigDefinition
+  pelvis: {fileID: 0}
+  leftHip: {fileID: 0}
+  leftKnee: {fileID: 0}
+  leftAnkle: {fileID: 0}
+  leftFoot: {fileID: 0}
+  rightHip: {fileID: 0}
+  rightKnee: {fileID: 0}
+  rightAnkle: {fileID: 0}
+  rightFoot: {fileID: 0}
+  spine: {fileID: 0}
+  chest: {fileID: 0}
+  neck: {fileID: 0}
+  head: {fileID: 0}
+  leftShoulder: {fileID: 0}
+  leftElbow: {fileID: 0}
+  leftWrist: {fileID: 0}
+  leftHand: {fileID: 0}
+  rightShoulder: {fileID: 0}
+  rightElbow: {fileID: 0}
+  rightWrist: {fileID: 0}
+  rightHand: {fileID: 0}
+  torsoRail:
+    controlPoints:
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+  leftLegRail:
+    controlPoints:
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+  rightLegRail:
+    controlPoints:
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+  leftArmRail:
+    controlPoints:
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+  rightArmRail:
+    controlPoints:
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+    - {fileID: 0}
+  samplesPerSegment: 8
+  chainPartitionGap: 0.05
+  cyclePeriod: 1
+  legPhaseOffset: 0.5
+  armPhaseOffset: 0.5
+  armsOppositeToLegs: 1
+  thighLength: 0.4
+  shinLength: 0.4
+  footLength: 0.15
+  upperArmLength: 0.35
+  forearmLength: 0.3
+  handLength: 0.1
+  kneeHingeAxis: {x: 0, y: 0, z: 1}
+  ankleHingeAxis: {x: 0, y: 0, z: 1}
+  elbowHingeAxis: {x: 0, y: 0, z: 1}
+  wristHingeAxis: {x: 0, y: 0, z: 0}
+  hipSpherical: 1
+  shoulderSpherical: 1
+  spineSpherical: 1
+  fabrikIterations: 4
+  damping: 0.1

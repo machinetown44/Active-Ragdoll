@@ -1,0 +1,23 @@
+{
+    "name": "Box3DArticulation",
+    "rootNamespace": "Box3DArticulation",
+    "references": [
+        "Box3D.Runtime",
+        "Box3D.Hybrid",
+        "Unity.Mathematics",
+        "Popcron.Gizmos",
+        "Unity.InputSystem",
+        "Unity.ML-Agents",
+        "MxM",
+        "Unity.Burst"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
