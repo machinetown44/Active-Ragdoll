@@ -1,0 +1,15 @@
+{
+    "name": "Box3D.Hybrid.Editor",
+    "rootNamespace": "Box3D.Hybrid.Editor",
+    "references": [
+        "Box3D.Hybrid",
+        "Box3D.Runtime",
+        "Unity.Mathematics"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "autoReferenced": true
+}

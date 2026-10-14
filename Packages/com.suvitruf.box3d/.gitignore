@@ -1,0 +1,14 @@
+# Native build output (WSL symlinks inside break Windows git — never commit).
+Box3D.Native~/build*/
+
+# Bindgen intermediate output (deployed copies live in Box3D/).
+Box3D.Native~/bindgen/generated/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+
+# Unity's hidden folders end with '~' (Samples~, Documentation~) — the global '*~'
+# backup-file pattern must not hide new files inside them from git.
+!*~/

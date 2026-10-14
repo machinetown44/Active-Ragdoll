@@ -10,7 +10,7 @@
   ],
   "dependencies": {
     "id.elemtk": "file:Packages/id.elemtk",
-    "com.suvitruf.box3d": "file:E:/Unity/box3d-unity",
+    "com.suvitruf.box3d": "file:Packages/com.suvitruf.box3d",
     "com.unity.ai.inference": "2.6.1",
     "com.unity.ai.navigation": "2.0.14",
     "com.unity.burst": "1.8.29",
