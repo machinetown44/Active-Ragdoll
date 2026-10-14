@@ -5,9 +5,9 @@ simulated with Box3D. Extracted from the Prototyping workspace as a clean-room
 project — it contains only what it needs and nothing cross-references the
 original workspace.
 
-**Status:** work in progress. The humanoid motion driver is dead code (it does
-not work); the current approach is rigid rotation of articulated bodies with
-root-velocity anticipation and root-COM coupling.
+**Status:** work in progress. Rigid rotation of articulated bodies tracking the
+animated pose works; active work is rest-pose and stabilization tuning
+(springs/damping), root-velocity anticipation, and root-COM coupling.
 
 ## Requirements
 
