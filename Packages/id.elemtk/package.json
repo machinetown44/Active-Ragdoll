@@ -1,0 +1,24 @@
+{
+  "name": "id.elemtk",
+  "displayName": "Element Toolkit",
+  "version": "1.0.0",
+  "unity": "6000.5",
+  "description": "Reusable UI Toolkit primitives for editor tooling: embedded inspectors, asset watching with change events, animation elements, and editor workflow scaffolding. Ships with an Animation module (originally ElementAnimationToolkit by instance.id).",
+  "type": "library",
+  "keywords": [
+    "UIToolkit",
+    "Editor",
+    "Tooling",
+    "Animation"
+  ],
+  "author": {
+    "name": "instance.id (original), workspace adaptation"
+  },
+  "samples": [
+    {
+      "displayName": "Element Animation Examples",
+      "description": "Example scene, components, and editor window demonstrating the Animation module elements and animations.",
+      "path": "Samples~"
+    }
+  ]
+}

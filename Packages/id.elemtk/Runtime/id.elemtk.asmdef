@@ -1,0 +1,16 @@
+{
+    "name": "id.elemtk",
+    "rootNamespace": "id.elemtk",
+    "references": [
+        "0Harmony"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
